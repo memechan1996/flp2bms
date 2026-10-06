@@ -15,7 +15,8 @@ class Note:
 class Channel:
     iid: int
     name: str
-    sample_path: str  # 解決済みの絶対パス
+    sample_path: str = ""  # 解決済みの絶対パス(kind="sample"のみ)
+    kind: str = "sample"  # "sample": wavを切り出す / "render": VSTi等をFL Studioでレンダリング
 
 
 @dataclass

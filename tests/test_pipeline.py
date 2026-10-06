@@ -1,12 +1,15 @@
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import fl_render
 import flp_reader
 from bms_writer import build_bms
 from flp2bms import DEFAULT_OUT
@@ -74,19 +77,103 @@ def test_reader_ignores_automation(tmp_path, monkeypatch):
         iid = 2
         name = "auto"
 
-    note = SimpleNamespace(group=1, position=0, length=96, key=60, velocity=100)
-    auto_note = SimpleNamespace(group=2, position=0, length=96, key=60, velocity=100)
+    class Item(SimpleNamespace):  # pyflpのItemModel同様、生フィールドは[]で引ける
+        def __getitem__(self, k):
+            return getattr(self, k)
+
+    note = Item(rack_channel=1, position=0, length=96, key=60, velocity=100)
+    auto_note = Item(rack_channel=2, position=0, length=96, key=60, velocity=100)
     pat = SimpleNamespace(length=384, notes=[note, auto_note])
-    item = SimpleNamespace(muted=False, pattern=pat, position=384, length=384, offsets=(0, 384))
-    audio_item = SimpleNamespace(muted=False, channel=FakeAutomation(), position=0, length=384, offsets=None)
-    track = type("T", (list,), {"enabled": True})([item, audio_item])
+    item = Item(item_flags=0x40, pattern=pat, position=384, length=384, start_offset=float("nan"))
+    muted_item = Item(item_flags=0x2040, pattern=pat, position=0, length=384, start_offset=-1.0)
+    audio_item = Item(item_flags=0x40, channel=FakeAutomation(), position=0, length=384, start_offset=-1.0)
+    track = type("T", (list,), {"enabled": True})([item, muted_item, audio_item])
     flp = SimpleNamespace(
         title="x", tempo=120.0, ppq=96,
         channels=[sampler, FakeAutomation()],
         arrangements=[SimpleNamespace(tracks=[track])],
     )
     monkeypatch.setattr(flp_reader.pyflp, "parse", lambda p: flp)
-    proj = flp_reader.read_flp(tmp_path / "x.flp")
+    flp_path = tmp_path / "x.flp"
+    flp_path.write_bytes(b"FLhd" + (6).to_bytes(4, "little") + bytes(6) + b"FLdt" + bytes(4))
+    proj = flp_reader.read_flp(flp_path)
     assert list(proj.channels) == [1]
-    assert [n.tick for n in proj.notes] == [384]  # automation側ノート/clipは含まれない
+    assert [n.tick for n in proj.notes] == [384]  # automation側ノート/clip、ミュートclipは含まれない
     assert any("Audio/Automation" in w for w in proj.warnings)
+
+
+REAL_FLP = Path(__file__).resolve().parent.parent / "res" / "Project_1.flp"
+
+
+@pytest.mark.skipif(not REAL_FLP.is_file(), reason="res/Project_1.flp がない")
+def test_real_flp_fl25():
+    """FL 25.2.4 で保存した実FLP(808 Kick/Snare、2パターン×4小節、130BPM)。"""
+    proj = flp_reader.read_flp(REAL_FLP)
+    assert proj.bpm == 130 and proj.ppq == 96
+    by_ch = {}
+    for n in proj.notes:
+        by_ch.setdefault(proj.channels[n.channel].name, []).append(n.tick)
+    assert by_ch["808 Kick"] == list(range(0, 3072, 96))
+    assert by_ch["808 Snare"] == list(range(1536 + 48, 3072, 96))
+    assert all(n.length == 0 and n.key == 60 for n in proj.notes)
+
+
+REAL_FLP2 = REAL_FLP.with_name("Project_2.flp")
+
+
+@pytest.mark.skipif(not REAL_FLP2.is_file(), reason="res/Project_2.flp がない")
+def test_real_flp_fl25_with_vsti():
+    """Project_1 + パターン3(4小節、Kick/Snare に加えて Vital/FLEX Bass のノート)。"""
+    proj = flp_reader.read_flp(REAL_FLP2)
+    by_ch = {}
+    for n in proj.notes:
+        by_ch.setdefault(proj.channels[n.channel].name, []).append(n.tick)
+    assert by_ch["808 Kick"] == list(range(0, 4608, 96))
+    assert by_ch["808 Snare"] == list(range(1536 + 48, 4608, 96))
+    assert len(by_ch["FLEX Bass"]) == 8 and len(by_ch["Vital"]) == 12
+    assert {ch.name: ch.kind for ch in proj.channels.values()}["Vital"] == "render"
+    assert all(t >= 3072 for t in by_ch["Vital"] + by_ch["FLEX Bass"])  # パターン3のみ
+
+
+def _render_setup():
+    proj = flp_reader.read_flp(REAL_FLP2)
+    notes = sorted((n for n in proj.notes if proj.channels[n.channel].kind == "render"),
+                   key=lambda n: (n.channel, n.key, n.length, n.velocity))
+    return proj, fl_render.layout(notes, proj.ppq, proj.bpm, 2.0)
+
+
+@pytest.mark.skipif(not REAL_FLP2.is_file(), reason="res/Project_2.flp がない")
+def test_build_render_flp(tmp_path):
+    proj, slots = _render_setup()
+    raw = REAL_FLP2.read_bytes()
+    out = fl_render.build_render_flp(raw, slots)
+    # FLに渡すファイルは3バイトDWORDイベントを元の形のまま保つ(補正するとFLが読めない)
+    assert any(short for _, _, short in flp_reader.iter_events(out))
+    p = tmp_path / "render.flp"
+    p.write_bytes(out)
+    back = flp_reader.read_flp(p)
+    assert [(n.tick, n.channel, n.key) for n in back.notes] == [(s.tick, s.note.channel, s.note.key) for s in slots]
+    assert len(slots) == 13 and slots[0].tick == proj.ppq * 4  # 先頭1小節は空ける
+
+
+def test_cut_slots():
+    ppq, bpm, sr = 96, 120.0, 1000  # 1tick = 1/192秒
+    note = Note(tick=0, length=96, key=60, velocity=100, channel=1)
+    slots = [fl_render.Slot(note, 192, 192)]  # 1秒目から最大1秒
+    audio = np.zeros(4000, dtype=np.float32)
+    audio[1000:1300] = 0.5  # 音は0.3秒、その後は無音
+    audio[2500] = 0.5  # スロット外の音は含めない
+    seg = fl_render.cut_slots(audio, sr, slots, ppq, bpm)[(1, 60, 96, 100)]
+    assert len(seg) == 300 and seg[0] == 0.5
+
+
+@pytest.mark.skipif(not (REAL_FLP2.is_file() and os.environ.get("FLP2BMS_FL_TEST")),
+                    reason="FL Studioでのレンダは FLP2BMS_FL_TEST=1 のときだけ(FLを閉じておく)")
+def test_render_with_fl():
+    proj, slots = _render_setup()
+    got = fl_render.render_project(proj, REAL_FLP2.read_bytes(), fl_render.find_fl(), 2.0)
+    assert len(got) == 13
+    for audio, sr in got.values():
+        level = np.abs(audio).max(axis=1)
+        assert level.max() > 0.1  # 無音でない
+        assert np.argmax(level > 1e-3) < sr * 0.005  # 頭が遅れていない
